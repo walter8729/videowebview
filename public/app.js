@@ -139,35 +139,81 @@ function playVideo(file) {
 }
 
 function filterTree(e) {
-    const term = e.target.value.toLowerCase();
-    const wrappers = document.querySelectorAll('.tree-node-wrapper');
+    const term = e.target.value.toLowerCase().trim();
+    const headers = document.querySelectorAll('.tree-node-wrapper'); // We need top level or all? 
+    // Actually, getting all wrappers flattens the list. We want to start from root.
+    const root = document.getElementById('file-tree');
 
-    wrappers.forEach(wrap => {
-        // Very basic filter: if it's a file and name matches, show.
-        // Ideally we should keep parents open. 
-        // For now, let's just opacity out non-matches or something simple.
-        if (term === '') {
-            wrap.style.display = 'block';
-            return;
-        }
+    // We need to treat only top-level children to avoid double processing in recursion logic, 
+    // but our recursion handles DOM elements, so passing the root's children is best.
 
-        // This is tricky with recursion in DOM. 
-        // Simple approach: Check name.
-        if (wrap.dataset.name.includes(term)) {
-            wrap.style.display = 'block';
-            // Ensure parent is visible? (Hard without parent refs)
-        } else {
-            // Hide if it's a leaf file that doesn't match
-            // But if it is a directory preventing children from showing?
-            // This simple search is sufficient for a "Simple" request.
-            // If it's a directory, we only hide if NONE of its children match? Too complex.
-            // Let's just filter leaf nodes (files).
-            if (wrap.querySelector('.folder-content')) {
-                // Directory: keep visible for now
-                wrap.style.display = 'block';
-            } else {
-                wrap.style.display = 'none';
-            }
-        }
+    // If we use querySelectorAll('.tree-node-wrapper'), we get everyone. 
+    // But we want to process hierarchically.
+    // So let's grab the direct children of the container.
+    const roots = Array.from(root.children);
+
+    roots.forEach(node => {
+        filterNode(node, term);
     });
+}
+
+function filterNode(wrapper, term) {
+    const name = wrapper.dataset.name || '';
+    const isDirectory = !!wrapper.querySelector('.folder-content');
+    const matchesName = name.includes(term);
+
+    // Case 1: Search cleared
+    if (term === '') {
+        wrapper.style.display = 'block';
+        if (isDirectory) {
+            const content = wrapper.querySelector('.folder-content');
+            content.classList.remove('open');
+            Array.from(content.children).forEach(child => filterNode(child, ''));
+        }
+        return true;
+    }
+
+    if (!isDirectory) {
+        // FILE
+        if (matchesName) {
+            wrapper.style.display = 'block';
+            return true;
+        } else {
+            wrapper.style.display = 'none';
+            return false;
+        }
+    } else {
+        // DIRECTORY
+        const content = wrapper.querySelector('.folder-content');
+        const children = Array.from(content.children);
+
+        // Case 2: Directory NAME matches
+        if (matchesName) {
+            // Show parent, reset children so they are available if user opens.
+            wrapper.style.display = 'block';
+            // We generally keep it closed if it's a direct match to keep UI clean, 
+            // but the user can open it to see everything.
+            content.classList.remove('open');
+            // Reset children to be visible (recursively with empty term)
+            children.forEach(child => filterNode(child, ''));
+            return true;
+        }
+
+        // Case 3: Directory doesn't match, check children (Recursive)
+        let hasVisibleChild = false;
+        children.forEach(child => {
+            if (filterNode(child, term)) {
+                hasVisibleChild = true;
+            }
+        });
+
+        if (hasVisibleChild) {
+            wrapper.style.display = 'block';
+            content.classList.add('open'); // Expand if path contains match
+            return true;
+        } else {
+            wrapper.style.display = 'none';
+            return false;
+        }
+    }
 }
