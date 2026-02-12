@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Library</title>
+    <!-- OvenPlayer CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/ovenplayer/dist/ovenplayer.js"></script>
+    
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-wrapper">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h2>Media Server</h2>
+            </div>
+            <div class="search-box">
+                <input type="text" id="search-input" placeholder="Buscar videos...">
+            </div>
+            <div id="file-tree" class="file-tree">
+                <div class="loading-spinner"></div>
+            </div>
+        </aside>
+        
+        <main class="main-content">
+            <div class="player-wrapper">
+                <div id="player"></div>
+                <div id="placeholder" class="placeholder">
+                    <div class="icon">▶️</div>
+                    <h2>Selecciona un video</h2>
+                    <p>Navega por el menú de la izquierda para reproducir contenido.</p>
+                </div>
+            </div>
+            
+            <div class="info-panel" id="info-panel">
+                <div class="info-header">
+                    <h1 id="video-title">Nombre del archivo</h1>
+                    <div class="badges">
+                        <span class="badge" id="file-type">MP4</span>
+                    </div>
+                </div>
+                <div class="info-actions">
+                    <a id="download-link" href="#" class="btn-primary" download>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="7 10 12 15 17 10"></polyline>
+                            <line x1="12" y1="15" x2="12" y2="3"></line>
+                        </svg>
+                        Descargar
+                    </a>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

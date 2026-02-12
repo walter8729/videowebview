@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  web_view:
+    build: .
+    container_name: web_view_container
+    ports:
+      - "3000:3000"
+    volumes:
+      - /media/noticias/:/videos
+    environment:
+      - VIDEO_ROOT=/videos
+    restart: unless-stopped
