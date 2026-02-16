@@ -1,191 +1,274 @@
 /**
  * =======================================================================================
- * SERVER.JS - El Punto de Entrada Principal de nuestro Servidor de Video
+ * SERVER.JS - Servidor de Video con Caché en Memoria + Watcher de Archivos
  * =======================================================================================
- * Este archivo configura un servidor web utilizando Node.js y el framework Express.
- * 
- * Qué hace este código:
- * 1. Configura variables de entorno (como claves secretas o rutas).
- * 2. Escanea una carpeta específica en tu disco duro para encontrar videos.
- * 3. Crea una lista (en formato JSON) de todos esos archivos encontrados.
- * 4. Sirve la interfaz web (HTML/JS) al navegador del usuario.
- * 5. Sirve los archivos de video reales para que puedan reproducirse.
+ * MEJORAS RESPECTO A LA VERSIÓN ANTERIOR:
+ *
+ * PROBLEMA ANTERIOR:
+ *   - Cada petición a /api/files disparaba un escaneo COMPLETO y SÍNCRONO del disco.
+ *   - fs.readdirSync/fs.statSync bloquean el Event Loop de Node.js.
+ *   - Con 10 clientes simultáneos = 10 escaneos completos al mismo tiempo → servidor lento.
+ *
+ * SOLUCIÓN IMPLEMENTADA:
+ *   1. CACHÉ EN MEMORIA: El árbol de archivos se escanea UNA SOLA VEZ al iniciar
+ *      y se guarda en una variable. Las peticiones siguientes responden al instante
+ *      desde memoria RAM, sin tocar el disco.
+ *
+ *   2. ESCANEO ASÍNCRONO: Se usa fs.promises (async/await) en lugar de las versiones
+ *      síncronas (*Sync). Esto significa que Node.js puede seguir atendiendo otras
+ *      peticiones MIENTRAS escanea, en vez de bloquearse.
+ *
+ *   3. FILE WATCHER: Se usa fs.watch() para vigilar la carpeta de videos.
+ *      Cuando se agrega, elimina o renombra un archivo, el watcher lo detecta
+ *      y programa un re-escaneo automático.
+ *
+ *   4. DEBOUNCE: El re-escaneo tiene un retraso de 2 segundos. Si se detectan
+ *      varios cambios seguidos (ej: copiar 50 archivos), el timer se reinicia
+ *      con cada cambio y solo escanea UNA VEZ cuando todo se estabiliza.
+ *      Esto evita re-escaneos repetitivos innecesarios.
+ *
+ * RESULTADO: El servidor puede atender cientos de clientes sin esfuerzo,
+ * y la lista de videos siempre estará actualizada automáticamente.
  */
 
 // 1. IMPORTACIÓN DE LIBRERÍAS
 // ----------------------------
-// 'dotenv' es una herramienta que carga configuración desde un archivo ".env".
-// Es una buena práctica para mantener configuraciones separadas del código.
 require('dotenv').config();
-
-// 'express' es el framework web más popular para Node.js.
-// Maneja las peticiones (cuando un usuario visita una página) y las respuestas.
 const express = require('express');
-
-// 'fs' significa 'File System' (Sistema de Archivos). 
-// Permite a Node.js leer y escribir archivos en tu computadora.
-// Lo usamos para leer el contenido de la carpeta de videos.
 const fs = require('fs');
-
-// 'path' es una utilidad para trabajar con rutas de archivos y carpetas.
-// Ayuda a asegurar que las rutas funcionen bien tanto en Windows ("\") como en Mac/Linux ("/").
 const path = require('path');
 
 // 2. CONFIGURACIÓN
 // ----------------
-// Creamos una instancia de la aplicación Express.
 const app = express();
-
-// El número de puerto en el que escuchará el servidor.
-// Accederás a él en tu navegador como http://localhost:3000
 const PORT = 3000;
 
-/**
- * ROOT_DIR: La carpeta donde están almacenados tus videos.
- * Prioridad de decisión:
- * 1. Revisa si 'VIDEO_ROOT' está definido en el archivo .env.
- * 2. Si no, usa por defecto la carpeta padre de este proyecto '..'.
- *    - __dirname es una variable especial que contiene la ruta del archivo actual.
- *    - path.resolve combina las rutas de forma segura.
- */
 const ROOT_DIR = process.env.VIDEO_ROOT || path.resolve(__dirname, '..');
-
-// Lista de extensiones de archivo que consideramos como "videos".
-// Se usan en minúsculas para facilitar la comparación.
 const VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.webm', '.avi', '.mov'];
 
-// 3. CONFIGURACIÓN DE MIDDLEWARE
-// ------------------------------
-// Los "Middleware" son funciones que se ejecutan antes del manejador final.
-// app.use(express.static(...)) le dice a Express que sirva archivos "estáticos" 
-// como HTML, CSS, JS e Imágenes directamente.
-// Esto sirve los archivos de la carpeta 'public' cuando alguien visita la página de inicio.
-app.use(express.static(path.join(__dirname, 'public')));
+// 3. CACHÉ EN MEMORIA
+// -------------------
+// Esta es la variable central de la mejora.
+// Guarda el árbol de archivos para no tener que re-escanear en cada petición.
+let cachedTree = null;         // El árbol de archivos (null = todavía no escaneado)
+let isScanRunning = false;     // Bandera para evitar dos escaneos simultáneos
+let debounceTimer = null;      // Referencia al timer del debounce
 
-// "Montamos" la carpeta ROOT_DIR (tus videos) en la ruta URL '/videos'.
-// Esto es un truco de mapeo y seguridad muy importante:
-// - Ruta Real en PC:   c:\CUDA\mis_vacaciones.mp4    (Ruta interna sensible)
-// - URL Web:           http://localhost:3000/videos/mis_vacaciones.mp4
-// El usuario solo ve "/videos/...", nunca la ruta real de tu disco duro.
+// 4. MIDDLEWARE
+// ------------
+app.use(express.static(path.join(__dirname, 'public')));
 app.use('/videos', express.static(ROOT_DIR));
 
 
+// 5. ESCANEO ASÍNCRONO DE DIRECTORIOS
+// ------------------------------------
 /**
- * 4. LA LÓGICA PRINCIPAL: ESCANEO RECURSIVO DE DIRECTORIOS
- * --------------------------------------------------------
- * Esta función busca en una carpeta y encuentra todos los videos dentro,
- * incluso si están dentro de sub-carpetas (esa es la parte "recursiva").
+ * Versión asíncrona del escaneo de directorios.
+ * Usa fs.promises en lugar de funciones *Sync para no bloquear el Event Loop.
  * 
- * @param {string} dir - La ruta absoluta del directorio a escanear.
- * @returns {Array} - Una lista de objetos representando archivos y carpetas.
+ * @param {string} dir - Ruta absoluta del directorio a escanear.
+ * @returns {Promise<Array>} - Promesa que resuelve con el árbol de archivos.
  */
-function scanDirectory(dir) {
-    let results = [];
+async function scanDirectoryAsync(dir) {
     let list;
 
-    // Intentamos leer el directorio. Si falla (ej. permiso denegado), capturamos el error.
     try {
-        // fs.readdirSync lee el directorio de forma "Síncrona" (pausa el código hasta terminar).
-        // Devuelve un array (lista) con los nombres de los archivos.
-        list = fs.readdirSync(dir);
+        // fs.promises.readdir es la versión NO bloqueante de fs.readdirSync
+        list = await fs.promises.readdir(dir);
     } catch (e) {
         console.warn(`Saltando directorio sin acceso: ${dir}`);
-        return []; // Retornamos lista vacía si no podemos leerlo
+        return [];
     }
 
-    // Recorremos cada archivo/carpeta encontrado en 'dir'
-    list.forEach(file => {
-        // FILTRADO:
-        // Saltamos archivos ocultos (empiezan con .), la carpeta 'node_modules' (es gigante),
-        // y nuestra propia carpeta de código 'web_view' para evitar desorden.
-        if (file.startsWith('.') || file === 'node_modules' || file === 'web_view') return;
+    // Procesamos todos los archivos en PARALELO con Promise.all
+    // En vez de esperar uno por uno, lanzamos todas las operaciones a la vez.
+    const results = await Promise.all(
+        list
+            .filter(file => !file.startsWith('.') && file !== 'node_modules' && file !== 'web_view')
+            .map(async (file) => {
+                const filePath = path.join(dir, file);
+                let stat;
 
-        // Creamos la ruta absoluta completa para este ítem
-        const filePath = path.join(dir, file);
-        let stat;
+                try {
+                    stat = await fs.promises.stat(filePath);
+                } catch (e) {
+                    return null; // Ignorar archivos inaccesibles
+                }
 
-        // Obtenemos "stats" (información) sobre el archivo: ¿Es archivo? ¿Es carpeta? ¿Cuánto pesa?
-        try {
-            stat = fs.statSync(filePath);
-        } catch (e) {
-            return; // Saltamos si no podemos leer la info
-        }
+                if (stat.isDirectory()) {
+                    const children = await scanDirectoryAsync(filePath);
 
-        if (stat.isDirectory()) {
-            // === AQUÍ OCURRE LA RECURSIVIDAD ===
-            // Si es una carpeta, llamamos a ESTA MISMA función scanDirectory() sobre ella.
-            // Esto es lo que nos permite explorar niveles profundos de carpetas.
-            const children = scanDirectory(filePath);
+                    if (children.length > 0) {
+                        return {
+                            name: file,
+                            type: 'directory',
+                            relativePath: path.relative(ROOT_DIR, filePath).replace(/\\/g, '/'),
+                            children: children
+                        };
+                    }
+                    return null; // Carpeta vacía, la ignoramos
 
-            // DECISIÓN LÓGICA:
-            // Solo añadimos esta carpeta a la lista si contiene algo útil
-            // (ya sean videos directos o subcarpetas con videos).
-            if (children.length > 0) {
-                results.push({
-                    name: file,
-                    type: 'directory',
-                    // Creamos una ruta relativa para que el frontend la use luego
-                    relativePath: path.relative(ROOT_DIR, filePath).replace(/\\/g, '/'),
-                    children: children // Adjuntamos los resultados encontrados dentro
-                });
-            }
-        } else {
-            // Es un archivo. Verificamos si es un video.
-            const ext = path.extname(file).toLowerCase(); // Obtenemos extensión ej: '.mp4'
+                } else {
+                    const ext = path.extname(file).toLowerCase();
 
-            if (VIDEO_EXTENSIONS.includes(ext)) {
-                // ¡Es un video! Lo agregamos a nuestra lista de resultados.
-                results.push({
-                    name: file,
-                    type: 'file',
-                    relativePath: path.relative(ROOT_DIR, filePath).replace(/\\/g, '/'),
-                    size: stat.size
-                });
-            }
-        }
-    });
+                    if (VIDEO_EXTENSIONS.includes(ext)) {
+                        return {
+                            name: file,
+                            type: 'file',
+                            relativePath: path.relative(ROOT_DIR, filePath).replace(/\\/g, '/'),
+                            size: stat.size
+                        };
+                    }
+                    return null; // No es un video
+                }
+            })
+    );
 
-    // LIMPIEZA FINAL: Ordenar
-    // Ordenamos para que las Carpetas aparezcan primero (A-Z), y luego los Archivos (A-Z).
-    // Esto hace que la vista de árbol se vea estándar y organizada.
-    return results.sort((a, b) => {
-        // Si ambos son del mismo tipo, ordenar por nombre
-        if (a.type === b.type) return a.name.localeCompare(b.name);
-        // Si son diferentes, Carpeta (-1) va antes que Archivo (1)
-        return a.type === 'directory' ? -1 : 1;
-    });
+    // Filtramos los nulls (archivos ignorados) y ordenamos: carpetas primero, luego por nombre
+    return results
+        .filter(Boolean)
+        .sort((a, b) => {
+            if (a.type === b.type) return a.name.localeCompare(b.name);
+            return a.type === 'directory' ? -1 : 1;
+        });
 }
 
-// 5. DEFINICIÓN DE RUTAS API
-// --------------------------
-// Cuando el frontend pide datos (visita /api/files), ejecuta esta función.
-// (req = la petición del usuario, res = la respuesta que enviamos)
-app.get('/api/files', (req, res) => {
-    console.log('Escaneando archivos...');
-    try {
-        // Llamamos a nuestra función de escaneo empezando en la carpeta raíz
-        const tree = scanDirectory(ROOT_DIR);
-        // Respondemos con los datos en formato JSON
-        res.json(tree);
-    } catch (err) {
-        // Si algo se rompe, lo registramos y decimos al usuario "Error de Servidor" (500)
-        console.error(err);
-        res.status(500).json({ error: 'Fallo al escanear directorio' });
+
+// 6. GESTOR DE CACHÉ
+// ------------------
+/**
+ * Inicia un escaneo y actualiza la caché cuando termina.
+ * Si ya hay un escaneo en curso, no lanza uno nuevo (evita trabajo duplicado).
+ */
+async function refreshCache() {
+    if (isScanRunning) {
+        console.log('[Cache] Escaneo ya en curso, omitiendo solicitud duplicada.');
+        return;
     }
+
+    isScanRunning = true;
+    console.log('[Cache] Iniciando escaneo de directorio...');
+    const startTime = Date.now();
+
+    try {
+        const tree = await scanDirectoryAsync(ROOT_DIR);
+        cachedTree = tree; // ← Actualizar la caché con los nuevos datos
+        const elapsed = Date.now() - startTime;
+        console.log(`[Cache] Escaneo completado en ${elapsed}ms. ${countFiles(tree)} videos encontrados.`);
+    } catch (err) {
+        console.error('[Cache] Error durante el escaneo:', err);
+    } finally {
+        isScanRunning = false;
+    }
+}
+
+/** Cuenta el total de archivos de video en el árbol (para el log). */
+function countFiles(tree) {
+    return tree.reduce((acc, item) => {
+        if (item.type === 'file') return acc + 1;
+        if (item.type === 'directory') return acc + countFiles(item.children);
+        return acc;
+    }, 0);
+}
+
+
+// 7. WATCHER DE ARCHIVOS CON DEBOUNCE
+// ------------------------------------
+/**
+ * fs.watch vigila la carpeta ROOT_DIR en busca de cambios.
+ * 'recursive: true' permite detectar cambios en sub-carpetas también.
+ * 
+ * El DEBOUNCE evita re-escaneos repetitivos:
+ * - Si se copian 100 archivos, el watcher dispara 100 eventos muy rápido.
+ * - Sin debounce: 100 escaneos innecesarios.
+ * - Con debounce de 2s: espera 2 segundos de "silencio" y escanea UNA sola vez.
+ */
+const DEBOUNCE_DELAY_MS = 2000; // 2 segundos de espera tras el último cambio
+
+function setupWatcher() {
+    try {
+        const watcher = fs.watch(ROOT_DIR, { recursive: true }, (eventType, filename) => {
+            // Ignorar cambios en archivos que no son videos para no re-escanear innecesariamente
+            if (filename) {
+                const ext = path.extname(filename).toLowerCase();
+                // Aceptamos también sin extensión porque podría ser una carpeta nueva
+                if (ext && !VIDEO_EXTENSIONS.includes(ext)) return;
+            }
+
+            console.log(`[Watcher] Cambio detectado: ${eventType} → ${filename || 'desconocido'}`);
+
+            // Cancelar el timer anterior si existe (reiniciar el debounce)
+            if (debounceTimer) clearTimeout(debounceTimer);
+
+            // Programar un nuevo escaneo para cuando los cambios se estabilicen
+            debounceTimer = setTimeout(() => {
+                console.log('[Watcher] Cambios estabilizados. Actualizando caché...');
+                refreshCache();
+            }, DEBOUNCE_DELAY_MS);
+        });
+
+        watcher.on('error', (err) => {
+            console.error('[Watcher] Error en el watcher de archivos:', err);
+        });
+
+        console.log(`[Watcher] Vigilando cambios en: ${ROOT_DIR}`);
+    } catch (err) {
+        // En algunos sistemas (ej: redes SMB/NFS) fs.watch puede no ser compatible.
+        // En ese caso, advertimos al usuario pero el servidor sigue funcionando con caché manual.
+        console.warn('[Watcher] No se pudo iniciar el watcher automático (puede ser una ruta de red).');
+        console.warn('[Watcher] La caché se actualizará solo al reiniciar el servidor o via /api/refresh.');
+    }
+}
+
+
+// 8. RUTAS DE LA API
+// ------------------
+
+/**
+ * GET /api/files
+ * Responde con el árbol de videos desde la caché en memoria.
+ * Si la caché aún no está lista (primer arranque lento), devuelve un estado 503.
+ */
+app.get('/api/files', (req, res) => {
+    if (cachedTree === null) {
+        // La caché todavía no está lista (el escaneo inicial aún no terminó)
+        return res.status(503).json({
+            error: 'El servidor está iniciando. Por favor, reintenta en unos segundos.',
+            loading: true
+        });
+    }
+    // ✅ Respuesta instantánea desde memoria, sin tocar el disco
+    res.json(cachedTree);
 });
 
-// Ruta de Respaldo (Fallback):
-// Si el usuario pide cualquier otra URL, simplemente le enviamos el index.html principal.
-// Común en Aplicaciones de Una Sola Página (SPAs).
+/**
+ * POST /api/refresh
+ * Permite forzar manualmente un re-escaneo de la caché.
+ * Útil si el watcher falla (ej: carpetas de red) o para uso administrativo.
+ * Ejemplo de uso: fetch('/api/refresh', { method: 'POST' })
+ */
+app.post('/api/refresh', async (req, res) => {
+    console.log('[API] Re-escaneo manual solicitado.');
+    refreshCache(); // Lanzamos el escaneo en segundo plano (no esperamos a que termine)
+    res.json({ message: 'Re-escaneo iniciado. La caché se actualizará en breve.' });
+});
+
+// Fallback para SPA
 app.use((req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// 6. INICIAR EL SERVIDOR
+
+// 9. INICIAR EL SERVIDOR
 // ----------------------
-// Decimos a Express que empiece a escuchar conexiones en el PUERTO especificado.
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', async () => {
     console.log(`\n--- SERVIDOR DE VIDEO INICIADO ---`);
     console.log(`Interfaz disponible en: http://localhost:${PORT}`);
     console.log(`Sirviendo videos desde: ${ROOT_DIR}`);
+
+    // Escaneo inicial al arrancar el servidor
+    await refreshCache();
+
+    // Iniciar el watcher para detectar cambios futuros automáticamente
+    setupWatcher();
 });
