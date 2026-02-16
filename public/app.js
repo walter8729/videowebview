@@ -9,9 +9,20 @@
 
 document.addEventListener('DOMContentLoaded', () => {
     fetchFiles();
-    document.getElementById('search-input').addEventListener('input', filterTree);
+    document.getElementById('search-input').addEventListener('input', (e) => filterTree(e.target.value));
     document.getElementById('refresh-btn').addEventListener('click', handleRefresh);
+
+
+
+    document.getElementById('clear-btn').addEventListener('click', () => {
+        const input = document.getElementById('search-input');
+        input.value = '';
+        input.focus();
+        filterTree('');
+    });
 });
+// Global variable to store total count for restoration
+let globalTotalVideos = 0;
 
 let player = null;
 
@@ -41,6 +52,7 @@ async function fetchFiles() {
         }
 
         const data = await response.json();
+        updateVideoCount(data);
         renderTree(data, treeContainer);
 
     } catch (error) {
@@ -182,10 +194,48 @@ function playVideo(file) {
 // BÚSQUEDA / FILTRO
 // ─────────────────────────────────────────────
 
-function filterTree(e) {
-    const term = e.target.value.toLowerCase().trim();
+function updateVideoCount(items) {
+    globalTotalVideos = countTotalVideos(items);
+    updateCountDisplay(globalTotalVideos, false);
+}
+
+function updateCountDisplay(count, isFiltered) {
+    const countElement = document.getElementById('video-count-display');
+    if (!countElement) return;
+
+    if (isFiltered) {
+        countElement.textContent = `${count} videos encontrados (filtrado)`;
+        // If filtered count is same as total, show standard msg? 
+        // Maybe "X videos encontrados" is fine, but user asked for "found with criteria"
+    } else {
+        countElement.textContent = `${count} Videos encontrados`;
+    }
+}
+
+// ─────────────────────────────────────────────
+// BÚSQUEDA / FILTRO
+// ─────────────────────────────────────────────
+
+function filterTree(term) {
+    term = term.toLowerCase().trim();
     const root = document.getElementById('file-tree');
-    Array.from(root.children).forEach(node => filterNode(node, term));
+    const clearBtn = document.getElementById('clear-btn');
+
+    // Show/hide clear button
+    if (clearBtn) {
+        clearBtn.style.display = term ? 'flex' : 'none';
+    }
+
+    let matchCount = 0;
+    Array.from(root.children).forEach(node => {
+        matchCount += filterNode(node, term);
+    });
+
+    if (term === '') {
+        updateCountDisplay(globalTotalVideos, false);
+    } else {
+        updateCountDisplay(matchCount, true);
+    }
 }
 
 function filterNode(wrapper, term) {
@@ -199,37 +249,80 @@ function filterNode(wrapper, term) {
             const content = wrapper.querySelector('.folder-content');
             content.classList.remove('open');
             wrapper.querySelector('.tree-item').style.color = 'var(--text-secondary)';
-            Array.from(content.children).forEach(child => filterNode(child, ''));
+
+            let count = 0;
+            Array.from(content.children).forEach(child => {
+                count += filterNode(child, '');
+            });
+            return count;
         }
-        return true;
+        return 1; // It's a file
     }
 
     if (!isDirectory) {
-        wrapper.style.display = matchesName ? 'block' : 'none';
-        return matchesName;
-    } else {
-        const content = wrapper.querySelector('.folder-content');
-        const children = Array.from(content.children);
-
         if (matchesName) {
             wrapper.style.display = 'block';
-            content.classList.remove('open');
-            wrapper.querySelector('.tree-item').style.color = 'var(--text-secondary)';
-            children.forEach(child => filterNode(child, ''));
-            return true;
+            return 1;
+        } else {
+            wrapper.style.display = 'none';
+            return 0;
         }
+    } else {
+        // Directory
+        const content = wrapper.querySelector('.folder-content');
+        const children = Array.from(content.children);
+        let countInSubtree = 0;
+
+        if (matchesName) {
+            // Folder matches -> show distinct highlight maybe? or just show everything inside
+            wrapper.style.display = 'block';
+            content.classList.remove('open'); // Maybe open? User might want to see contents. 
+            // Usually if folder matches, you show folder. 
+            // But to count items inside, we must traverse.
+
+            // Current UX: show folder closed.
+            wrapper.querySelector('.tree-item').style.color = 'var(--text-secondary)'; // or highlight?
+
+            // To get accurate count, even if folder matches, we count all children as matches
+            children.forEach(child => {
+                countInSubtree += filterNode(child, ''); // Reset filter for children so they are all "visible" logically
+            });
+            return countInSubtree;
+        } // End matchesName
 
         let hasVisibleChild = false;
-        children.forEach(child => { if (filterNode(child, term)) hasVisibleChild = true; });
+        children.forEach(child => {
+            const childCount = filterNode(child, term);
+            if (childCount > 0) {
+                hasVisibleChild = true;
+                countInSubtree += childCount;
+            }
+        });
 
         if (hasVisibleChild) {
             wrapper.style.display = 'block';
             content.classList.add('open');
             wrapper.querySelector('.tree-item').style.color = 'var(--text-primary)';
-            return true;
+            return countInSubtree;
         } else {
             wrapper.style.display = 'none';
-            return false;
+            return 0;
         }
     }
+}
+
+function countTotalVideos(items) {
+    let count = 0;
+    if (!items) return 0;
+
+    for (const item of items) {
+        if (item.type === 'directory') {
+            if (item.children) {
+                count += countTotalVideos(item.children);
+            }
+        } else {
+            count++;
+        }
+    }
+    return count;
 }

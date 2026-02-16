@@ -89,19 +89,51 @@ body {
     padding: 15px;
 }
 
-.search-box input {
-    width: 100%;
+.search-container {
+    display: flex;
+    align-items: center;
     background-color: var(--bg-dark);
     border: 1px solid var(--border);
-    padding: 10px;
     border-radius: 6px;
-    color: var(--text-primary);
-    font-size: 0.9rem;
+    padding: 0 5px;
+    overflow: hidden;
 }
 
-.search-box input:focus {
+.search-container input {
+    width: 100%;
+    background-color: transparent;
+    border: none;
+    padding: 10px;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    flex: 1;
+}
+
+.search-container input:focus {
     outline: none;
+}
+
+.search-container:focus-within {
     border-color: var(--accent);
+}
+
+.search-container button {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--text-secondary);
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.2s;
+    border-radius: 4px;
+}
+
+.search-container button:hover {
+    color: var(--accent);
+    background-color: rgba(255, 255, 255, 0.05);
 }
 
 .file-tree {
